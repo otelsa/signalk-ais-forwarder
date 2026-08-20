@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AIS Forwarder Noomi</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img src="./app-icon.svg" alt="" />
+        <h1>AIS Forwarder</h1>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px">
+        <span id="status-pill" class="status-pill"
+          ><span class="dot"></span><span id="status-text">lade...</span></span
+        >
+        <button
+          id="refresh"
+          class="icon-button"
+          aria-label="Aktualisieren"
+          title="Aktualisieren"
+        >
+          <span aria-hidden="true">↻</span>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="kpi-row" id="kpis" aria-live="polite"></section>
+
+      <section class="note">
+        <strong>Hinweis:</strong> UDP kennt keine Empfangsbestätigung.
+        „Gesendet“ bedeutet nur, dass das Betriebssystem das Paket lokal
+        erfolgreich abgeschickt hat — nicht, dass MarineTraffic/AISHub es
+        tatsächlich empfangen hat. Als Indiz dafür, dass die Weiterleitung
+        wirklich funktioniert, dient vor allem die Zahl der aktiv verfolgten
+        AIS-Ziele: solange die &gt; 0 ist, empfängt dieser Signal-K-Server
+        laufend AIS-Daten und kodiert sie neu.
+      </section>
+
+      <section class="panel">
+        <h2>Endpunkte</h2>
+        <div class="table-scroll">
+          <table id="endpoints-table">
+            <thead>
+              <tr>
+                <th>Ziel</th>
+                <th>Gesendet</th>
+                <th>Bytes</th>
+                <th>Zuletzt</th>
+                <th>Fehler</th>
+              </tr>
+            </thead>
+            <tbody id="endpoints-body"></tbody>
+          </table>
+        </div>
+        <div id="endpoints-empty" class="panel-empty" hidden>
+          Keine Endpunkte konfiguriert.
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Aktive AIS-Ziele</h2>
+        <div class="table-scroll">
+          <table id="targets-table">
+            <thead>
+              <tr>
+                <th>MMSI</th>
+                <th>Name</th>
+                <th>Klasse</th>
+                <th>Zuletzt gesehen</th>
+                <th>Zuletzt gesendet</th>
+              </tr>
+            </thead>
+            <tbody id="targets-body"></tbody>
+          </table>
+        </div>
+        <div id="targets-empty" class="panel-empty" hidden>
+          Aktuell keine AIS-Ziele empfangen.
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Letzte gesendete Sätze</h2>
+        <div id="log" class="log"></div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

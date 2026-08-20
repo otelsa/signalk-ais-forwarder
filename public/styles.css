@@ -1,0 +1,255 @@
+:root {
+  color-scheme: dark;
+  --bg: #242424;
+  --panel: #383838;
+  --panel-strong: #303030;
+  --text: #f0f0f0;
+  --muted: #a8a8a8;
+  --line: #4a4a4a;
+  --accent: #d97928;
+  --ok: #75c985;
+  --warn: #e3b651;
+  --bad: #e35151;
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px clamp(14px, 3vw, 28px) 8px;
+  background: #2d2d2d;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.brand img {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  border-radius: 8px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 650;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--panel-strong);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.status-pill .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.status-pill.ok .dot {
+  background: var(--ok);
+}
+.status-pill.warn .dot {
+  background: var(--warn);
+}
+.status-pill.bad .dot {
+  background: var(--bad);
+}
+
+.icon-button {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: #3d3d3d;
+  color: var(--text);
+  font-size: 30px;
+  cursor: pointer;
+}
+
+main {
+  padding: clamp(12px, 2.6vw, 24px);
+  display: grid;
+  gap: clamp(14px, 2.4vw, 22px);
+}
+
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: clamp(12px, 2vw, 16px);
+}
+
+.kpi {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 10px 18px rgb(0 0 0 / 20%);
+}
+
+.kpi-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.kpi-value {
+  margin-top: 4px;
+  font-size: 26px;
+  font-weight: 650;
+}
+
+.kpi-sub {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.note {
+  padding: 12px 16px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.panel {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.panel-empty {
+  color: var(--muted);
+  font-size: 13.5px;
+  padding: 8px 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+
+th,
+td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+td.mono,
+.log {
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+}
+
+.class-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  background: var(--panel-strong);
+  color: var(--muted);
+}
+
+.class-badge.a {
+  color: var(--accent);
+}
+.class-badge.b {
+  color: var(--ok);
+}
+
+.error-text {
+  color: var(--bad);
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.log {
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.log .at {
+  color: var(--text);
+  opacity: 0.6;
+  margin-right: 8px;
+}
+
+.disabled-card {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 32px 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  text-align: center;
+}
+
+.disabled-card img {
+  width: 72px;
+  height: 72px;
+}
