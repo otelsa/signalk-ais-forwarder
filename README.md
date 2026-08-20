@@ -18,11 +18,30 @@ Developed on `noomi-lookout` (the boat's navigation Pi, where the node/npm/git
 toolchain lives), but **runs on `noomi`** (the i5N100 host), not on
 `noomi-lookout` — this plugin isn't navigation-essential, so it has no
 business running on the box steering depends on. `noomi` runs Signal K in
-Docker; deployment is `npm pack` on `noomi-lookout` followed by `npm
-install <tarball>` inside the `signalk` container against the
-`~/noomi-data/signalk` volume (see `signalk-distance-log-n2k` for the
-existing local-plugin convention there). `aisreporter` (own position)
-still runs on `noomi-lookout`, unaffected.
+Docker; deployment is `npm pack` on `noomi-lookout`, `scp` the tarball
+into `~/noomi-data/signalk/`, then inside the `signalk` container:
+
+```bash
+npm install ./signalk-ais-forwarder-noomi-1.0.0.tgz   # extracts into node_modules/
+mv node_modules/signalk-ais-forwarder-noomi ../signalk-ais-forwarder-noomi
+# edit package.json: "signalk-ais-forwarder-noomi": "file:signalk-ais-forwarder-noomi"
+npm install                                             # relinks node_modules/... -> ../signalk-ais-forwarder-noomi
+```
+
+The source must end up as a **sibling of `node_modules`**, not inside it.
+A `file:` dependency whose target path is itself under `node_modules/`
+(e.g. `file:node_modules/signalk-ais-forwarder-noomi`, the pattern
+`signalk-distance-log-n2k` uses on this host) is fragile: npm's own
+`node_modules/.package-lock.json` records a `resolved` tarball/path
+snapshot from install time, and any later `npm install`/`npm remove`
+elsewhere in the tree can try to reconcile against that stale snapshot,
+deleting the one real copy of the plugin before "reinstalling" it from
+itself -- ENOENT. This bit us once during an unrelated plugin removal on
+`noomi` (see git history). The sibling-directory form npm resolves to a
+proper `"link": true` entry, which survives arbitrary tree reconciliation
+because npm only ever has to recreate a symlink, never the source
+content. `aisreporter` (own position) still runs on `noomi-lookout`,
+unaffected.
 
 ## Why a fork, and why this design
 
