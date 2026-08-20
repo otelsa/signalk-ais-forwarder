@@ -12,6 +12,18 @@ already covered well by
 keeps running unchanged alongside this plugin. This plugin only relays
 what the vessel _receives_.
 
+## Deployment
+
+Developed on `noomi-lookout` (the boat's navigation Pi, where the node/npm/git
+toolchain lives), but **runs on `noomi`** (the i5N100 host), not on
+`noomi-lookout` — this plugin isn't navigation-essential, so it has no
+business running on the box steering depends on. `noomi` runs Signal K in
+Docker; deployment is `npm pack` on `noomi-lookout` followed by `npm
+install <tarball>` inside the `signalk` container against the
+`~/noomi-data/signalk` volume (see `signalk-distance-log-n2k` for the
+existing local-plugin convention there). `aisreporter` (own position)
+still runs on `noomi-lookout`, unaffected.
+
 ## Why a fork, and why this design
 
 This plugin started as an evaluation of two existing projects:
@@ -27,14 +39,19 @@ This plugin started as an evaluation of two existing projects:
   fork — encodes AIS sentences directly from the Signal K **data
   model** rather than from raw NMEA text.
 
-On this installation (and on any Signal K server whose AIS receiver is
-an NMEA2000 device rather than a serial NMEA0183 unit), received AIS
-targets arrive as PGNs on the N2K bus and are converted straight into
-the Signal K data model (`vessels.<mmsi>.navigation.position`, etc.) —
-there is no `!AIVDM` sentence anywhere unless a separate
-NMEA2000-to-0183 conversion plugin (e.g. `signalk-n2kais-to-nmea0183`)
-is also installed and enabled. `ais-forwarder`'s raw-NMEA-listening
-approach would simply never fire in that setup.
+On `noomi-lookout`, where this plugin was first evaluated (and on any
+Signal K server whose AIS receiver is an NMEA2000 device rather than a
+serial NMEA0183 unit), received AIS targets arrive as PGNs on the N2K bus
+and are converted straight into the Signal K data model
+(`vessels.<mmsi>.navigation.position`, etc.) — there is no `!AIVDM`
+sentence anywhere unless a separate NMEA2000-to-0183 conversion plugin
+(e.g. `signalk-n2kais-to-nmea0183`) is also installed and enabled.
+`ais-forwarder`'s raw-NMEA-listening approach would simply never fire in
+that setup. The data-model approach works there without needing that
+converter plugin, and works identically on `noomi` (which has both an N2K
+bus and a direct serial AIS receiver, plus `signalk-n2kais-to-nmea0183`
+already enabled) regardless of which of those sources a given target
+came from.
 
 So this plugin is a fork of **aisreporter's architecture and AIS-encoding
 code**, extended from "encode and send _my own_ position" to "encode and
