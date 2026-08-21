@@ -241,4 +241,32 @@ describe('signalk-ais-forwarder-noomi', () => {
     expect(snapshot.endpoints[0].ipaddress).to.equal('127.0.0.1')
     expect(snapshot.messagesSentTotal).to.be.greaterThan(0)
   })
+
+  it('registerWithRouter does not throw against a router without .access() (observed on noomi: server-api declares it, some core builds do not implement it)', async () => {
+    const h = await createHarness()
+    const plugin = createPlugin(h.app)
+    plugin.start({
+      endpoints: [],
+      pollIntervalSeconds: 100,
+      minForwardIntervalSeconds: 100,
+      staticUpdateIntervalSeconds: 100,
+      targetStalenessMinutes: 15
+    })
+
+    let snapshot: any
+    const bareRouter: any = {
+      get: (
+        _path: string,
+        handler: (req: unknown, res: { json: (b: unknown) => void }) => void
+      ) => {
+        handler({}, { json: (body: unknown) => (snapshot = body) })
+      }
+    }
+
+    expect(() => plugin.registerWithRouter(bareRouter)).to.not.throw()
+    expect(snapshot.targetsTracked).to.equal(0)
+
+    plugin.stop()
+    await h.close()
+  })
 })

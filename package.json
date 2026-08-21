@@ -1,6 +1,6 @@
 {
   "name": "signalk-ais-forwarder-noomi",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Forwards received AIS targets (and optionally raw AIVDM/AIVDO traffic) from Signal K to UDP endpoints such as MarineTraffic or AISHub roaming stations, with a status webapp",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

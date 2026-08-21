@@ -423,9 +423,23 @@ const createPlugin = function (appUntyped: ServerAPI) {
     },
 
     registerWithRouter: function (router: PluginRouter) {
-      router.access('readonly').get('/status', (_req, res) => {
+      const statusHandler = (
+        _req: unknown,
+        res: { json: (body: unknown) => void }
+      ) => {
         res.json(stats.snapshot(plugin.started))
-      })
+      }
+      // router.access() is declared in @signalk/server-api's types but not
+      // implemented by every server build using that same types version
+      // (observed: server-api 2.31.1 with a core that throws
+      // "router.access is not a function"). An uncaught throw here aborts
+      // this plugin's admin registration entirely -- including the
+      // enable/disable config route -- so this must never throw.
+      if (typeof router.access === 'function') {
+        router.access('readonly').get('/status', statusHandler)
+      } else {
+        router.get('/status', statusHandler)
+      }
     },
 
     schema: {
