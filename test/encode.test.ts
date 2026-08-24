@@ -159,6 +159,106 @@ describe('static data', () => {
       })
     ).to.be.undefined
   })
+
+  it('sends Class B part 1 when only shipType is present, even with no dimensions', () => {
+    const nmea = encodeStaticClassBPartOne({
+      mmsi: '211234567',
+      aisClass: 'B',
+      name: 'x',
+      shipType: 37
+    })
+    expect(nmea).to.be.a('string')
+  })
+
+  it('sends Class B part 1 when only callsign is present, even with no dimensions', () => {
+    const nmea = encodeStaticClassBPartOne({
+      mmsi: '211234567',
+      aisClass: 'B',
+      name: 'x',
+      callsign: 'DA1234'
+    })
+    expect(nmea).to.be.a('string')
+  })
+
+  it('sends Class B part 1 when all four dimension fields are present but nothing else is', () => {
+    const nmea = encodeStaticClassBPartOne({
+      mmsi: '211234567',
+      aisClass: 'B',
+      name: 'x',
+      length: 12,
+      beam: 4,
+      fromBow: 6,
+      fromCenter: 0
+    })
+    expect(nmea).to.be.a('string')
+  })
+
+  it('omits Class B part 1 when only some, not all, dimension fields are present', () => {
+    expect(
+      encodeStaticClassBPartOne({
+        mmsi: '211234567',
+        aisClass: 'B',
+        name: 'x',
+        length: 12,
+        beam: 4
+        // fromBow/fromCenter missing -- an incomplete dimension set is
+        // treated the same as none at all, not padded with zeros.
+      })
+    ).to.be.undefined
+  })
+
+  it('clamps a negative dimension (fromBow past the reported length) to zero instead of wrapping', () => {
+    // Without clamping, ggencoder packs a negative "dimB" as its two's
+    // complement bit pattern -- a huge bogus positive dimension on the
+    // wire, not an error. length=10, fromBow=15 => dimB would be -5.
+    const nmea = encodeStaticClassA({
+      mmsi: '211234567',
+      aisClass: 'A',
+      name: 'x',
+      length: 10,
+      beam: 4,
+      fromBow: 15,
+      fromCenter: 0
+    })
+    const decoded = new AisDecode(nmea as string)
+    expect(decoded.valid).to.equal(true)
+    expect(decoded.dimB).to.equal(0)
+  })
+
+  it('warns when clamping an out-of-range dimension, so the config inconsistency is not silently invisible', () => {
+    const warnings: string[] = []
+    encodeStaticClassA(
+      {
+        mmsi: '211234567',
+        aisClass: 'A',
+        name: 'x',
+        length: 10,
+        beam: 4,
+        fromBow: 15, // > length -- dimB would go negative
+        fromCenter: 0
+      },
+      (msg) => warnings.push(msg)
+    )
+    expect(warnings).to.have.length(1)
+    expect(warnings[0]).to.match(/clamping/)
+  })
+
+  it('does not warn when dimensions are within range', () => {
+    const warnings: string[] = []
+    encodeStaticClassA(
+      {
+        mmsi: '211234567',
+        aisClass: 'A',
+        name: 'x',
+        length: 12,
+        beam: 4,
+        fromBow: 6,
+        fromCenter: 0
+      },
+      (msg) => warnings.push(msg)
+    )
+    expect(warnings).to.have.length(0)
+  })
 })
 
 describe('sanitizeEndpoints', () => {
@@ -184,6 +284,44 @@ describe('sanitizeEndpoints', () => {
     expect(warnings).to.have.length(1)
   })
 
+  it('drops endpoints with an invalid port for every kind of bad value, not just out-of-range', () => {
+    for (const badPort of [0, -1, 1.5, NaN, '14577', undefined, null]) {
+      const warnings: string[] = []
+      const result = sanitizeEndpoints(
+        [{ ipaddress: '1.2.3.4', port: badPort }],
+        (msg) => warnings.push(msg)
+      )
+      expect(result, `port ${JSON.stringify(badPort)}`).to.have.length(0)
+      expect(warnings, `port ${JSON.stringify(badPort)}`).to.have.length(1)
+    }
+  })
+
+  it('drops an endpoint with an invalid ipaddress and warns', () => {
+    for (const badAddress of ['', 'has\r\ncrlf', 123, null, undefined]) {
+      const warnings: string[] = []
+      const result = sanitizeEndpoints(
+        [{ ipaddress: badAddress, port: 14577 }],
+        (msg) => warnings.push(msg)
+      )
+      expect(result, `ipaddress ${JSON.stringify(badAddress)}`).to.have.length(
+        0
+      )
+      expect(
+        warnings,
+        `ipaddress ${JSON.stringify(badAddress)}`
+      ).to.have.length(1)
+    }
+  })
+
+  it('drops a non-object endpoint entry and warns', () => {
+    const warnings: string[] = []
+    const result = sanitizeEndpoints(['not-an-object', 5, null], (msg) =>
+      warnings.push(msg)
+    )
+    expect(result).to.have.length(0)
+    expect(warnings).to.have.length(3)
+  })
+
   it('drops non-array input entirely', () => {
     expect(sanitizeEndpoints(undefined, () => undefined)).to.deep.equal([])
     expect(sanitizeEndpoints('nope', () => undefined)).to.deep.equal([])
@@ -200,5 +338,17 @@ describe('sanitizeRateSeconds', () => {
 
   it('keeps a valid positive value', () => {
     expect(sanitizeRateSeconds(30, 60)).to.equal(30)
+  })
+
+  it('clamps a valid but sub-floor value up to the given minimum', () => {
+    // Guards the two cadence knobs (poll/minForward interval) against a
+    // fat-fingered sub-second value hammering the data model or flooding
+    // the configured UDP endpoints.
+    expect(sanitizeRateSeconds(0.01, 10, 1)).to.equal(1)
+    expect(sanitizeRateSeconds(5, 10, 1)).to.equal(5)
+  })
+
+  it('has no floor by default, preserving the original unclamped behaviour', () => {
+    expect(sanitizeRateSeconds(0.01, 10)).to.equal(0.01)
   })
 })

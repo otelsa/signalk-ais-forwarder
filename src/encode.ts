@@ -166,29 +166,49 @@ function putDimensions(
   length: number | undefined,
   beam: number | undefined,
   fromBow: number | undefined,
-  fromCenter: number | undefined
+  fromCenter: number | undefined,
+  warn?: (msg: string) => void
 ): { dimA: string; dimB: string; dimC: string; dimD: string } {
   const l = length ?? 0
   const b = beam ?? 0
   const bow = fromBow ?? 0
   const center = fromCenter ?? 0
+  const rawDimB = l - bow
+  const rawDimC = b / 2 + center
+  const rawDimD = b / 2 - center
+  // Clamped to 0: a miscalibrated fromBow/fromCenter config value (e.g.
+  // fromBow > length) would otherwise go negative here, and ggencoder packs
+  // a negative dimension as its two's-complement bit pattern -- a huge
+  // "valid" positive dimension on the wire instead of an error. Warn
+  // (rather than silently reporting a plausible-looking 0) so the
+  // underlying config inconsistency doesn't go unnoticed indefinitely --
+  // matching how sanitizeEndpoints() reports a rejected value below.
+  if (warn && (bow < 0 || rawDimB < 0 || rawDimC < 0 || rawDimD < 0)) {
+    warn(
+      `clamping an out-of-range ship dimension to 0 (length=${l}, beam=${b}, fromBow=${bow}, fromCenter=${center}) -- check design.length/design.beam/sensors.gps.fromBow/fromCenter for an inconsistency`
+    )
+  }
   return {
-    dimA: bow.toFixed(0),
-    dimB: (l - bow).toFixed(0),
-    dimC: (b / 2 + center).toFixed(0),
-    dimD: (b / 2 - center).toFixed(0)
+    dimA: Math.max(0, bow).toFixed(0),
+    dimB: Math.max(0, rawDimB).toFixed(0),
+    dimC: Math.max(0, rawDimC).toFixed(0),
+    dimD: Math.max(0, rawDimD).toFixed(0)
   }
 }
 
 // Class A static & voyage data (type 5). Only emitted when there's at
 // least a name or callsign, matching aisreporter's gating for self.
-export function encodeStaticClassA(target: TargetStatic): string | undefined {
+export function encodeStaticClassA(
+  target: TargetStatic,
+  warn?: (msg: string) => void
+): string | undefined {
   if (!target.name && !target.callsign) return undefined
   const dims = putDimensions(
     target.length,
     target.beam,
     target.fromBow,
-    target.fromCenter
+    target.fromCenter,
+    warn
   )
   const encoded = new AisEncode({
     mmsi: target.mmsi,
@@ -219,7 +239,8 @@ export function encodeStaticClassBPartZero(
 }
 
 export function encodeStaticClassBPartOne(
-  target: TargetStatic
+  target: TargetStatic,
+  warn?: (msg: string) => void
 ): string | undefined {
   if (
     target.shipType === undefined &&
@@ -235,7 +256,8 @@ export function encodeStaticClassBPartOne(
     target.length,
     target.beam,
     target.fromBow,
-    target.fromCenter
+    target.fromCenter,
+    warn
   )
   const encoded = new AisEncode({
     aistype: 24,
@@ -294,10 +316,11 @@ export function sanitizeEndpoints(
 // sanitizeRateSeconds.
 export function sanitizeRateSeconds(
   value: unknown,
-  defaultSeconds: number
+  defaultSeconds: number,
+  minSeconds = 0
 ): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     return defaultSeconds
   }
-  return value
+  return Math.max(minSeconds, value)
 }

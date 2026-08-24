@@ -1,5 +1,5 @@
 /*
- * signalk-ais-forwarder-noomi
+ * signalk-ais-forwarder
  *
  * Forwards AIS targets received by this Signal K server (from an N2K bus,
  * a serial AIS receiver, or any other source that ends up in the Signal K
@@ -122,18 +122,29 @@ function readConfig(
 ): PluginConfig {
   return {
     endpoints: sanitizeEndpoints(props.endpoints, warn),
-    pollIntervalSeconds: sanitizeRateSeconds(props.pollIntervalSeconds, 10),
+    // A floor of 1s on the two knobs that drive network/CPU cadence keeps a
+    // fat-fingered sub-second value from hammering app.signalk.retrieve()
+    // (a full data-model walk) or flooding MarineTraffic/AISHub far past any
+    // reasonable AIS reporting rate.
+    pollIntervalSeconds: sanitizeRateSeconds(props.pollIntervalSeconds, 10, 1),
     minForwardIntervalSeconds: sanitizeRateSeconds(
       props.minForwardIntervalSeconds,
-      10
+      10,
+      1
     ),
     staticUpdateIntervalSeconds: sanitizeRateSeconds(
       props.staticUpdateIntervalSeconds,
-      360
+      360,
+      1
     ),
+    // A floor here too: at the extreme (e.g. 0.001min = 60ms), a position
+    // could never be fresh enough to forward -- not a flooding risk like
+    // the two knobs above, but the opposite failure, total silent
+    // starvation (targetsTracked stays 0 forever, no error anywhere).
     targetStalenessMinutes: sanitizeRateSeconds(
       props.targetStalenessMinutes,
-      15
+      15,
+      1
     )
   }
 }
@@ -153,10 +164,19 @@ const createPlugin = function (appUntyped: ServerAPI) {
   let lastStartError: string | undefined
 
   function broadcast(nmea: string): void {
+    const endpoints = cfg?.endpoints ?? []
+    if (endpoints.length === 0 || !udpSocket) {
+      // Nothing actually goes out -- don't count it as sent, or
+      // messagesSentTotal/messagesSentLastMinute would keep climbing in the
+      // status view even though every endpoint was dropped (e.g. by a typo
+      // sanitizeEndpoints rejected), masking exactly the "silently stopped
+      // forwarding" failure this status is meant to catch.
+      debug(nmea)
+      return
+    }
     const line = nmea + '\n'
     const bytes = Buffer.byteLength(line)
-    for (const endpoint of cfg?.endpoints ?? []) {
-      if (!udpSocket) continue
+    for (const endpoint of endpoints) {
       udpSocket.send(
         line,
         0,
@@ -235,8 +255,8 @@ const createPlugin = function (appUntyped: ServerAPI) {
       const position = positionNode?.value as Position | undefined
       if (
         !position ||
-        typeof position.latitude !== 'number' ||
-        typeof position.longitude !== 'number' ||
+        !Number.isFinite(position.latitude) ||
+        !Number.isFinite(position.longitude) ||
         isNullIsland(position)
       ) {
         continue
@@ -269,16 +289,21 @@ const createPlugin = function (appUntyped: ServerAPI) {
         const info = buildStatic(mmsi, vessel, aisClass)
         const messages =
           aisClass === 'A'
-            ? [encodeStaticClassA(info)]
+            ? [encodeStaticClassA(info, error)]
             : [
                 encodeStaticClassBPartZero(info),
-                encodeStaticClassBPartOne(info)
+                encodeStaticClassBPartOne(info, error)
               ]
-        const sentAny = messages.some((nmea) => {
-          if (!nmea) return false
+        // Broadcast every message that encoded, not just the first --
+        // Array.some() would stop at the first truthy result, silently
+        // dropping Class B's second sentence (ship type/callsign/
+        // dimensions) whenever the first (the name) encodes successfully.
+        let sentAny = false
+        for (const nmea of messages) {
+          if (!nmea) continue
           broadcast(nmea)
-          return true
-        })
+          sentAny = true
+        }
         if (sentAny) lastStaticAt.set(mmsi, now)
       }
     }
@@ -361,8 +386,8 @@ const createPlugin = function (appUntyped: ServerAPI) {
   }
 
   const plugin: Plugin & { started: boolean } = {
-    id: 'signalk-ais-forwarder-noomi',
-    name: 'AIS Forwarder (Noomi)',
+    id: 'signalk-ais-forwarder',
+    name: 'AIS Forwarder',
     description:
       'Forwards received AIS targets from the Signal K data model to UDP endpoints (MarineTraffic, AISHub, ...) so this vessel can act as a roaming AIS station',
     started: false,
@@ -374,7 +399,7 @@ const createPlugin = function (appUntyped: ServerAPI) {
         typeof app.selfId !== 'string'
       ) {
         const msg =
-          'signalk-ais-forwarder-noomi not started: server is missing app.signalk.retrieve/app.selfId'
+          'signalk-ais-forwarder not started: server is missing app.signalk.retrieve/app.selfId'
         error(msg)
         lastStartError = msg
         plugin.started = false
@@ -390,6 +415,19 @@ const createPlugin = function (appUntyped: ServerAPI) {
       }
 
       udpSocket = dgram.createSocket('udp4')
+      // A socket-level fault (the ephemeral port bind on first send failing,
+      // EMFILE, a transient network-stack error, ...) emits 'error' on the
+      // socket itself, separately from any individual send()'s callback. An
+      // EventEmitter with no 'error' listener throws on that event, and an
+      // uncaught throw from a timer callback would crash the whole Signal K
+      // server, not just this plugin.
+      udpSocket.on('error', (err) => {
+        error(`UDP socket error: ${err.message}`)
+        // Not just a log line: without this, the plugin keeps looking
+        // "started and healthy" in /status and setPluginStatus() even
+        // though the socket broadcast() sends into is now likely broken.
+        stats.noteSocketError(err.message)
+      })
       pollTimer = setInterval(poll, cfg.pollIntervalSeconds * 1000)
       statusTimer = setInterval(publishStatus, 5000)
       plugin.started = true
@@ -429,17 +467,32 @@ const createPlugin = function (appUntyped: ServerAPI) {
       ) => {
         res.json(stats.snapshot(plugin.started))
       }
+      type Registrar = { get: (path: string, handler: typeof statusHandler) => unknown }
       // router.access() is declared in @signalk/server-api's types but not
       // implemented by every server build using that same types version
       // (observed: server-api 2.31.1 with a core that throws
       // "router.access is not a function"). An uncaught throw here aborts
       // this plugin's admin registration entirely -- including the
-      // enable/disable config route -- so this must never throw.
+      // enable/disable config route -- so this must never throw, whether
+      // router.access is missing or present-but-throws. Resolve which
+      // object to register against first, then register exactly once --
+      // a single call site means '/status' can never end up registered
+      // twice, regardless of which fallback path is taken.
+      let target: Registrar = router
       if (typeof router.access === 'function') {
-        router.access('readonly').get('/status', statusHandler)
+        try {
+          target = router.access('readonly')
+        } catch (err) {
+          error(
+            `router.access threw, falling back to an unauthenticated /status route: ${(err as Error).message}`
+          )
+        }
       } else {
-        router.get('/status', statusHandler)
+        debug(
+          'router.access unavailable on this server build -- registering /status without readonly access scoping'
+        )
       }
+      target.get('/status', statusHandler)
     },
 
     schema: {
@@ -469,23 +522,27 @@ const createPlugin = function (appUntyped: ServerAPI) {
           type: 'number',
           title:
             'How often to scan the Signal K data model for AIS targets (s)',
-          default: 10
+          default: 10,
+          minimum: 1
         },
         minForwardIntervalSeconds: {
           type: 'number',
           title: 'Minimum time between position forwards per target (s)',
-          default: 10
+          default: 10,
+          minimum: 1
         },
         staticUpdateIntervalSeconds: {
           type: 'number',
           title: 'Static/voyage data resend interval per target (s)',
-          default: 360
+          default: 360,
+          minimum: 1
         },
         targetStalenessMinutes: {
           type: 'number',
           title:
             'Stop forwarding a target once its position is older than this (min)',
-          default: 15
+          default: 15,
+          minimum: 1
         }
       }
     }

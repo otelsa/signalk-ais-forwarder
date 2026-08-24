@@ -1,4 +1,4 @@
-# signalk-ais-forwarder-noomi
+# signalk-ais-forwarder
 
 Forwards AIS targets received by this Signal K server — other vessels'
 positions, not this vessel's own — to UDP endpoints such as
@@ -22,15 +22,15 @@ Docker; deployment is `npm pack` on `noomi-lookout`, `scp` the tarball
 into `~/noomi-data/signalk/`, then inside the `signalk` container:
 
 ```bash
-npm install ./signalk-ais-forwarder-noomi-1.0.0.tgz   # extracts into node_modules/
-mv node_modules/signalk-ais-forwarder-noomi ../signalk-ais-forwarder-noomi
-# edit package.json: "signalk-ais-forwarder-noomi": "file:signalk-ais-forwarder-noomi"
-npm install                                             # relinks node_modules/... -> ../signalk-ais-forwarder-noomi
+npm install ./signalk-ais-forwarder-1.0.0.tgz   # extracts into node_modules/
+mv node_modules/signalk-ais-forwarder ../signalk-ais-forwarder
+# edit package.json: "signalk-ais-forwarder": "file:signalk-ais-forwarder"
+npm install                                             # relinks node_modules/... -> ../signalk-ais-forwarder
 ```
 
 The source must end up as a **sibling of `node_modules`**, not inside it.
 A `file:` dependency whose target path is itself under `node_modules/`
-(e.g. `file:node_modules/signalk-ais-forwarder-noomi`, the pattern
+(e.g. `file:node_modules/signalk-ais-forwarder`, the pattern
 `signalk-distance-log-n2k` uses on this host) is fragile: npm's own
 `node_modules/.package-lock.json` records a `resolved` tarball/path
 snapshot from install time, and any later `npm install`/`npm remove`
@@ -96,7 +96,7 @@ a navigational status.
 ## Configuration
 
 Configured in the Signal K admin UI under **Server → Plugin Config →
-AIS Forwarder (Noomi)**:
+AIS Forwarder**:
 
 | Setting                          | Default                            | Meaning                                                                                                                                        |
 | -------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |

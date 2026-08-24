@@ -1,6 +1,6 @@
 {
-  "name": "signalk-ais-forwarder-noomi",
-  "version": "1.0.1",
+  "name": "signalk-ais-forwarder",
+  "version": "1.1.0",
   "description": "Forwards received AIS targets (and optionally raw AIVDM/AIVDO traffic) from Signal K to UDP endpoints such as MarineTraffic or AISHub roaming stations, with a status webapp",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -22,10 +22,6 @@
     }
   ],
   "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "local:noomi-lookout/signalk-ais-forwarder-noomi"
-  },
   "keywords": [
     "signalk-node-server-plugin",
     "signalk-category-ais",
@@ -40,7 +36,7 @@
   },
   "signalk": {
     "appIcon": "./public/app-icon.svg",
-    "displayName": "AIS Forwarder (Noomi)"
+    "displayName": "AIS Forwarder"
   },
   "files": [
     "dist",

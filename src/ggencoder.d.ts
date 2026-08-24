@@ -32,6 +32,7 @@ declare module 'ggencoder' {
     constructor(nmea: string)
     valid: boolean
     aistype: number
+    part: number
     mmsi: string
     lat: number
     lon: number

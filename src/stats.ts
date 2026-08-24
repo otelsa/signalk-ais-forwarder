@@ -28,6 +28,18 @@ const RECENT_MESSAGES_LIMIT = 25
 // Long enough to smooth a burst, short enough that "messages/min" reacts
 // within a minute of endpoints actually going quiet.
 const RATE_WINDOW_MS = 60_000
+// Unlike every other structure in this class, seenMmsiEver is deliberately
+// never pruned by activity (it's a lifetime distinct-vessel counter, and a
+// vessel that goes stale and later reappears must NOT be double-counted).
+// That correctness requirement means it can't be swapped for a plain
+// incrementing counter -- it genuinely needs to remember every mmsi ever
+// seen. This cap is a pure safety backstop against unbounded growth on an
+// unattended multi-year run, set far above any realistic count (worldwide
+// MMSI allocations only number in the low hundreds of thousands) so it is
+// not expected to ever actually bind in practice; if it does, the oldest
+// entries are evicted and could in principle be double-counted on
+// reappearance, but by then the metric was already an approximation.
+const SEEN_MMSI_CAP = 100_000
 
 export interface StatusSnapshot {
   startedAt: number
@@ -101,6 +113,16 @@ export class Stats {
     this.lastErrorAt = Date.now()
   }
 
+  // For faults that aren't tied to any one endpoint (a socket-level error --
+  // EMFILE, a bind failure -- rather than an individual send() failing).
+  // Surfaces the same way an endpoint send error does (lastError/lastErrorAt
+  // in the snapshot, and therefore in both /status and setPluginStatus()),
+  // so a socket fault doesn't look like a silently-still-healthy plugin.
+  noteSocketError(message: string): void {
+    this.lastError = message
+    this.lastErrorAt = Date.now()
+  }
+
   noteMessageBroadcast(nmea: string): void {
     const now = Date.now()
     this.totalMessagesSent++
@@ -125,6 +147,16 @@ export class Stats {
     aisClass: 'A' | 'B'
   ): void {
     const now = Date.now()
+    if (
+      !this.seenMmsiEver.has(mmsi) &&
+      this.seenMmsiEver.size >= SEEN_MMSI_CAP
+    ) {
+      // Set iteration order is insertion order (ECMA-262), so this is
+      // reliably the oldest still-tracked entry. The size check above
+      // guarantees at least one entry exists, so .value is always a string
+      // here, never undefined -- no need to guard it again.
+      this.seenMmsiEver.delete(this.seenMmsiEver.values().next().value as string)
+    }
     this.seenMmsiEver.add(mmsi)
     const existing = this.targets.get(mmsi)
     if (existing) {
@@ -148,10 +180,6 @@ export class Stats {
     for (const mmsi of Array.from(this.targets.keys())) {
       if (!activeMmsi.has(mmsi)) this.targets.delete(mmsi)
     }
-  }
-
-  targetsTrackedCount(): number {
-    return this.targets.size
   }
 
   snapshot(enabled: boolean): StatusSnapshot {

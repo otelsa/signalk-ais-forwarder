@@ -1,4 +1,4 @@
-const STATUS_URL = '/plugins/signalk-ais-forwarder-noomi/status'
+const STATUS_URL = '/plugins/signalk-ais-forwarder/status'
 const REFRESH_MS = 5000
 
 const kpisEl = document.querySelector('#kpis')
