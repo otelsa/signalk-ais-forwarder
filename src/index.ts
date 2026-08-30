@@ -22,8 +22,13 @@
  * sentence. This works regardless of whether the original AIS traffic
  * arrived via N2K, serial NMEA0183, or another plugin.
  *
- * Own-vessel position reporting is intentionally NOT handled here --
- * that is already covered by the separate aisreporter plugin.
+ * Own-vessel position reporting is optional (see the `ownVessel` config
+ * group, off by default) and reuses the exact same encode.ts functions
+ * as target forwarding. It exists so a host that already runs this
+ * plugin for targets doesn't need @signalk/aisreporter installed too
+ * just to also report its own position -- both can still run side by
+ * side (e.g. on different hosts, or with different endpoint sets) if
+ * that's preferable; this is additive, not a replacement.
  */
 
 import * as dgram from 'dgram'
@@ -108,12 +113,43 @@ function classifyAis(positionPgn: number | undefined): 'A' | 'B' {
   return positionPgn === 129038 ? 'A' : 'B'
 }
 
+interface OwnVesselConfig {
+  enabled: boolean
+  positionRateSeconds: number
+  staticRateSeconds: number
+  sendLastKnownPosition: boolean
+  lastKnownPositionRateSeconds: number
+}
+
 interface PluginConfig {
   endpoints: Endpoint[]
   pollIntervalSeconds: number
   minForwardIntervalSeconds: number
   staticUpdateIntervalSeconds: number
   targetStalenessMinutes: number
+  ownVessel: OwnVesselConfig
+}
+
+function readOwnVesselConfig(raw: unknown): OwnVesselConfig {
+  const props = (raw && typeof raw === 'object' ? raw : {}) as Record<
+    string,
+    unknown
+  >
+  return {
+    enabled: props.enabled === true,
+    // Defaults mirror @signalk/aisreporter's own defaults (60s/360s/180s)
+    // -- self-reporting to an aggregator conventionally runs much slower
+    // than target tracking's 10s default, so this gets its own knobs
+    // rather than reusing pollIntervalSeconds/staticUpdateIntervalSeconds.
+    positionRateSeconds: sanitizeRateSeconds(props.positionRateSeconds, 60, 1),
+    staticRateSeconds: sanitizeRateSeconds(props.staticRateSeconds, 360, 1),
+    sendLastKnownPosition: props.sendLastKnownPosition === true,
+    lastKnownPositionRateSeconds: sanitizeRateSeconds(
+      props.lastKnownPositionRateSeconds,
+      180,
+      1
+    )
+  }
 }
 
 function readConfig(
@@ -145,7 +181,8 @@ function readConfig(
       props.targetStalenessMinutes,
       15,
       1
-    )
+    ),
+    ownVessel: readOwnVesselConfig(props.ownVessel)
   }
 }
 
@@ -317,6 +354,109 @@ const createPlugin = function (appUntyped: ServerAPI) {
     }
   }
 
+  // Own-vessel reporting state. Single-value, not a Map keyed by mmsi like
+  // the target maps above -- there is exactly one self.
+  let ownVesselLastForwardAt = 0
+  let ownVesselLastStaticAt = 0
+  let ownVesselLastKnownSentAt = 0
+  let ownVesselLastGoodNmea: string | undefined
+  let ownVesselFirstPositionSeen = false
+  let ownVesselMissingMmsiWarned = false
+
+  // Mirrors @signalk/aisreporter's own tick()/sendStaticReport()/
+  // sendLastPositionReport() behaviour, but folded into this plugin's
+  // existing poll-driven architecture (one interval, due-ness checked
+  // per call) instead of three separate setInterval timers, and built
+  // on the same encode.ts functions target forwarding already uses --
+  // always reported as Class B (aisreporter never supported Class A
+  // self-reporting either; a vessel with a real Class A transponder
+  // already broadcasts over RF and has no need for this).
+  function pollOwnVessel(): void {
+    if (!cfg?.ownVessel.enabled) return
+    const now = Date.now()
+    const vessels = app.signalk.retrieve().vessels ?? {}
+    const self = vessels[app.selfId]
+    if (!self) return
+
+    const mmsi =
+      getValue<string>(self, 'mmsi') ?? (self.mmsi as string | undefined)
+    if (!mmsi) {
+      if (!ownVesselMissingMmsiWarned) {
+        error(
+          'ownVessel.enabled is on but this vessel has no mmsi configured -- own-vessel reporting will not start until one is set'
+        )
+        ownVesselMissingMmsiWarned = true
+      }
+      return
+    }
+
+    const positionNode = getNode(self, 'navigation.position')
+    const position = positionNode?.value as Position | undefined
+    const hasFreshPosition =
+      !!position &&
+      Number.isFinite(position.latitude) &&
+      Number.isFinite(position.longitude) &&
+      !isNullIsland(position)
+
+    let sentFreshThisTick = false
+    if (
+      hasFreshPosition &&
+      now - ownVesselLastForwardAt >= cfg.ownVessel.positionRateSeconds * 1000
+    ) {
+      const nmea = encodePositionReport(
+        buildDynamic(mmsi, self, 'B', position as Position)
+      )
+      if (nmea) {
+        broadcast(nmea)
+        ownVesselLastForwardAt = now
+        ownVesselLastGoodNmea = nmea
+        sentFreshThisTick = true
+        // Announce a fresh vessel to aggregators immediately on its first
+        // real dynamic reading, same as aisreporter -- force the static
+        // report below to fire on this same tick rather than waiting a
+        // full staticRateSeconds.
+        if (!ownVesselFirstPositionSeen) {
+          ownVesselFirstPositionSeen = true
+          ownVesselLastStaticAt = 0
+        }
+      }
+    }
+
+    // Keep pinging the last good fix at a slower cadence while anchored/
+    // GPS-lost, so the vessel doesn't silently vanish from trackers.
+    // Never fires ahead of a fresh send in the same tick -- a fresh
+    // position already carries newer information than a replay of the
+    // last one would.
+    if (
+      cfg.ownVessel.sendLastKnownPosition &&
+      !sentFreshThisTick &&
+      ownVesselLastGoodNmea !== undefined &&
+      now - ownVesselLastKnownSentAt >=
+        cfg.ownVessel.lastKnownPositionRateSeconds * 1000
+    ) {
+      broadcast(ownVesselLastGoodNmea)
+      ownVesselLastKnownSentAt = now
+    }
+
+    if (
+      ownVesselFirstPositionSeen &&
+      now - ownVesselLastStaticAt >= cfg.ownVessel.staticRateSeconds * 1000
+    ) {
+      const info = buildStatic(mmsi, self, 'B')
+      const messages = [
+        encodeStaticClassBPartZero(info),
+        encodeStaticClassBPartOne(info, error)
+      ]
+      let sentAny = false
+      for (const nmea of messages) {
+        if (!nmea) continue
+        broadcast(nmea)
+        sentAny = true
+      }
+      if (sentAny) ownVesselLastStaticAt = now
+    }
+  }
+
   function publishStatus(): void {
     if (!cfg) return
     const snapshot = stats.snapshot(plugin.started)
@@ -348,9 +488,28 @@ const createPlugin = function (appUntyped: ServerAPI) {
       {
         path: 'aisForwarder.status.endpointsWithErrors',
         value: snapshot.endpoints.filter((e) => e.lastError).length
+      },
+      {
+        path: 'aisForwarder.status.ownVesselEnabled',
+        value: cfg.ownVessel.enabled
+      },
+      {
+        path: 'aisForwarder.status.ownVesselLastPositionAgeSeconds',
+        value:
+          cfg.ownVessel.enabled && ownVesselLastForwardAt
+            ? Math.round((Date.now() - ownVesselLastForwardAt) / 1000)
+            : null
       }
     ]
     const meta = [
+      {
+        path: 'aisForwarder.status.ownVesselLastPositionAgeSeconds',
+        value: {
+          description:
+            "Seconds since this vessel's own position was last reported. null until ownVessel reporting is enabled and has sent a first position.",
+          units: 's'
+        }
+      },
       {
         path: 'aisForwarder.status.targetsTracked',
         value: {
@@ -381,6 +540,9 @@ const createPlugin = function (appUntyped: ServerAPI) {
     } as unknown as Parameters<ServerAPI['handleMessage']>[1])
     app.setPluginStatus(
       `${snapshot.targetsTracked} Ziele aktiv, ${snapshot.messagesSentLastMinute} Msg/min, ${snapshot.endpoints.length} Endpunkt(e)` +
+        (cfg.ownVessel.enabled
+          ? `, eigenes Schiff: ${ownVesselLastForwardAt ? Math.round((Date.now() - ownVesselLastForwardAt) / 1000) + 's her' : 'noch keine Position'}`
+          : '') +
         (snapshot.lastError ? `, letzter Fehler: ${snapshot.lastError}` : '')
     )
   }
@@ -428,10 +590,14 @@ const createPlugin = function (appUntyped: ServerAPI) {
         // though the socket broadcast() sends into is now likely broken.
         stats.noteSocketError(err.message)
       })
-      pollTimer = setInterval(poll, cfg.pollIntervalSeconds * 1000)
+      pollTimer = setInterval(() => {
+        poll()
+        pollOwnVessel()
+      }, cfg.pollIntervalSeconds * 1000)
       statusTimer = setInterval(publishStatus, 5000)
       plugin.started = true
       poll()
+      pollOwnVessel()
       publishStatus()
     },
 
@@ -450,6 +616,12 @@ const createPlugin = function (appUntyped: ServerAPI) {
       }
       lastForwardAt.clear()
       lastStaticAt.clear()
+      ownVesselLastForwardAt = 0
+      ownVesselLastStaticAt = 0
+      ownVesselLastKnownSentAt = 0
+      ownVesselLastGoodNmea = undefined
+      ownVesselFirstPositionSeen = false
+      ownVesselMissingMmsiWarned = false
       cfg = undefined
       plugin.started = false
     },
@@ -467,7 +639,9 @@ const createPlugin = function (appUntyped: ServerAPI) {
       ) => {
         res.json(stats.snapshot(plugin.started))
       }
-      type Registrar = { get: (path: string, handler: typeof statusHandler) => unknown }
+      type Registrar = {
+        get: (path: string, handler: typeof statusHandler) => unknown
+      }
       // router.access() is declared in @signalk/server-api's types but not
       // implemented by every server build using that same types version
       // (observed: server-api 2.31.1 with a core that throws
@@ -543,6 +717,43 @@ const createPlugin = function (appUntyped: ServerAPI) {
             'Stop forwarding a target once its position is older than this (min)',
           default: 15,
           minimum: 1
+        },
+        ownVessel: {
+          type: 'object',
+          title: 'Own-vessel reporting',
+          description:
+            "Also report this vessel's own position/static data to the endpoints above, the same functionality @signalk/aisreporter provides -- off by default so installing this plugin never changes existing self-reporting setups. Uses this vessel's own mmsi (server settings), and always reports as AIS Class B.",
+          properties: {
+            enabled: {
+              type: 'boolean',
+              title: 'Enable own-vessel reporting',
+              default: false
+            },
+            positionRateSeconds: {
+              type: 'number',
+              title: 'Own-vessel position report rate (s)',
+              default: 60,
+              minimum: 1
+            },
+            staticRateSeconds: {
+              type: 'number',
+              title: 'Own-vessel static/voyage data resend interval (s)',
+              default: 360,
+              minimum: 1
+            },
+            sendLastKnownPosition: {
+              type: 'boolean',
+              title:
+                'Keep sending the last known position when a fresh position is not available (e.g. anchored, GPS lost)',
+              default: false
+            },
+            lastKnownPositionRateSeconds: {
+              type: 'number',
+              title: 'Last-known-position resend rate (s)',
+              default: 180,
+              minimum: 1
+            }
+          }
         }
       }
     }

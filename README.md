@@ -1,16 +1,22 @@
 # signalk-ais-forwarder
 
 Forwards AIS targets received by this Signal K server — other vessels'
-positions, not this vessel's own — to UDP endpoints such as
+positions — to UDP endpoints such as
 [MarineTraffic](https://help.marinetraffic.com/hc/en-us/articles/205282657-Add-an-AIS-Receiving-Station-to-the-MarineTraffic-Network)
 or [AISHub](https://www.aishub.net/), so this vessel can act as a
 **roaming AIS station** in areas without a fixed terrestrial receiver.
 
-Own-vessel position reporting is **not** handled by this plugin — that's
-already covered well by
-[`@signalk/aisreporter`](https://github.com/SignalK/aisreporter), which
-keeps running unchanged alongside this plugin. This plugin only relays
-what the vessel _receives_.
+Own-vessel position reporting is handled well by
+[`@signalk/aisreporter`](https://github.com/SignalK/aisreporter), and by
+default this plugin leaves that job to it and only relays what the
+vessel _receives_. Since v1.2.0, own-vessel reporting is also available
+here as an **optional, off-by-default** `ownVessel` config group (see
+[Configuration](#configuration) below) — reusing the exact same
+`src/encode.ts` functions as target forwarding — for hosts that would
+rather not install `@signalk/aisreporter` separately just to report
+their own position too. Both plugins can still run side by side (e.g.
+on different hosts, or with different endpoint sets) if that's
+preferable; this is additive, not a replacement.
 
 ## Deployment
 
@@ -111,6 +117,25 @@ per-account — `listener.marinetraffic.com:14577` above is prefilled to
 match what this vessel's `aisreporter` install already uses for its own
 position, since MarineTraffic accepts both own-position (AIVDO-derived)
 and other-vessel (AIVDM-derived) traffic on the same station feed.
+
+### Own-vessel reporting (optional)
+
+Off by default, and independent of everything above — enabling it does
+not change target forwarding, and it shares only the endpoint list and
+the encoding code. Configured under **Own-vessel reporting**:
+
+| Setting                        | Default | Meaning                                                                                                                             |
+| ------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Enabled                         | off     | Turns own-vessel position/static reporting on. Requires this vessel to have an MMSI configured (Server → Settings); logged once, otherwise, and reporting stays paused until one is set. |
+| Position rate                   | 60s     | How often this vessel's own position is (re-)encoded and sent, mirroring `aisreporter`'s default.                                    |
+| Static rate                     | 360s    | How often this vessel's own static/voyage data (name, callsign, dimensions) is (re-)sent, once a first position has gone out.        |
+| Send last known position        | off     | If on, keeps resending the last successfully sent position at the rate below whenever no fresh fix is available (e.g. GPS dropout).  |
+| Last known position resend rate | 180s    | Only used when "Send last known position" is on.                                                                                      |
+
+Own-vessel messages are encoded as AIS Class B (type 18 position, type
+24 static parts 0/1), same as `aisreporter`'s default. A vessel with no
+`mmsi` configured is logged once and simply skipped until one is set —
+it never throws or blocks target forwarding.
 
 ## Status webapp
 

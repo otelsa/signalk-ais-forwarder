@@ -155,7 +155,9 @@ export class Stats {
       // reliably the oldest still-tracked entry. The size check above
       // guarantees at least one entry exists, so .value is always a string
       // here, never undefined -- no need to guard it again.
-      this.seenMmsiEver.delete(this.seenMmsiEver.values().next().value as string)
+      this.seenMmsiEver.delete(
+        this.seenMmsiEver.values().next().value as string
+      )
     }
     this.seenMmsiEver.add(mmsi)
     const existing = this.targets.get(mmsi)

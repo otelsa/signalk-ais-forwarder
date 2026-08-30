@@ -669,4 +669,181 @@ describe('signalk-ais-forwarder', () => {
     )
     await h.close()
   })
+
+  describe('ownVessel reporting', () => {
+    function selfVessel(opts: { mmsi: string; lat: number; lon: number }): any {
+      return {
+        mmsi: opts.mmsi,
+        name: 'NOOMI',
+        navigation: {
+          position: {
+            value: { latitude: opts.lat, longitude: opts.lon },
+            timestamp: new Date().toISOString()
+          }
+        }
+      }
+    }
+
+    it('does not report the own vessel when ownVessel.enabled is unset (default off)', async () => {
+      const h = await createHarness()
+      h.vessels[h.app.selfId] = selfVessel({
+        mmsi: '211653340',
+        lat: 54.35,
+        lon: 18.65
+      })
+
+      const plugin = createPlugin(h.app)
+      plugin.start({
+        endpoints: [{ ipaddress: '127.0.0.1', port: h.port }],
+        pollIntervalSeconds: 100,
+        minForwardIntervalSeconds: 0.01,
+        staticUpdateIntervalSeconds: 100,
+        targetStalenessMinutes: 15
+      })
+
+      await new Promise((r) => setTimeout(r, 50))
+      plugin.stop()
+      await h.close()
+
+      expect(h.received.length).to.equal(0)
+    })
+
+    it('reports the own vessel as a decodable Class B type 18 sentence when ownVessel.enabled is on', async () => {
+      const h = await createHarness()
+      h.vessels[h.app.selfId] = selfVessel({
+        mmsi: '211653340',
+        lat: 54.35,
+        lon: 18.65
+      })
+
+      const plugin = createPlugin(h.app)
+      plugin.start({
+        endpoints: [{ ipaddress: '127.0.0.1', port: h.port }],
+        pollIntervalSeconds: 100,
+        minForwardIntervalSeconds: 100,
+        staticUpdateIntervalSeconds: 100,
+        targetStalenessMinutes: 15,
+        ownVessel: { enabled: true, positionRateSeconds: 0.01 }
+      })
+
+      await new Promise((r) => setTimeout(r, 50))
+      plugin.stop()
+      await h.close()
+
+      const decoded = h.received.map((b) => new AisDecode(b.toString().trim()))
+      const position = decoded.find((d) => d.aistype === 18)
+      expect(position).to.not.be.undefined
+      expect(position!.mmsi).to.equal('211653340')
+      expect(position!.lat).to.be.closeTo(54.35, 0.01)
+    })
+
+    it('sends own-vessel Class B static parts once a first position has been reported', async () => {
+      const h = await createHarness()
+      h.vessels[h.app.selfId] = {
+        ...selfVessel({ mmsi: '211653340', lat: 54.35, lon: 18.65 }),
+        communication: { callsignVhf: { value: 'DA9999' } }
+      }
+
+      const plugin = createPlugin(h.app)
+      plugin.start({
+        endpoints: [{ ipaddress: '127.0.0.1', port: h.port }],
+        pollIntervalSeconds: 100,
+        minForwardIntervalSeconds: 100,
+        staticUpdateIntervalSeconds: 100,
+        targetStalenessMinutes: 15,
+        ownVessel: {
+          enabled: true,
+          positionRateSeconds: 0.01,
+          staticRateSeconds: 100
+        }
+      })
+
+      await new Promise((r) => setTimeout(r, 50))
+      plugin.stop()
+      await h.close()
+
+      const decoded = h.received.map((b) => new AisDecode(b.toString().trim()))
+      const partZero = decoded.find((d) => d.aistype === 24 && d.part === 0)
+      const partOne = decoded.find((d) => d.aistype === 24 && d.part === 1)
+      expect(partZero, 'part 0 (name)').to.not.be.undefined
+      expect(partOne, 'part 1 (callsign)').to.not.be.undefined
+      expect(partOne!.callsign).to.equal('DA9999')
+    })
+
+    it('warns (without throwing) and sends nothing when ownVessel.enabled is on but this vessel has no mmsi', async () => {
+      const h = await createHarness()
+      h.vessels[h.app.selfId] = {
+        navigation: {
+          position: {
+            value: { latitude: 54.35, longitude: 18.65 },
+            timestamp: new Date().toISOString()
+          }
+        }
+      }
+      const errors: string[] = []
+      h.app.error = (msg: string) => errors.push(msg)
+
+      const plugin = createPlugin(h.app)
+      expect(() =>
+        plugin.start({
+          endpoints: [{ ipaddress: '127.0.0.1', port: h.port }],
+          pollIntervalSeconds: 100,
+          minForwardIntervalSeconds: 100,
+          staticUpdateIntervalSeconds: 100,
+          targetStalenessMinutes: 15,
+          ownVessel: { enabled: true, positionRateSeconds: 0.01 }
+        })
+      ).to.not.throw()
+
+      await new Promise((r) => setTimeout(r, 50))
+      plugin.stop()
+      await h.close()
+
+      expect(h.received.length).to.equal(0)
+      expect(errors.some((m) => m.includes('no mmsi'))).to.equal(true)
+    })
+
+    it('keeps resending the last known own-vessel position when sendLastKnownPosition is on and no fresh fix arrives', async function () {
+      this.timeout(5000)
+      const h = await createHarness()
+      h.vessels[h.app.selfId] = selfVessel({
+        mmsi: '211653340',
+        lat: 54.35,
+        lon: 18.65
+      })
+
+      const plugin = createPlugin(h.app)
+      plugin.start({
+        endpoints: [{ ipaddress: '127.0.0.1', port: h.port }],
+        pollIntervalSeconds: 1,
+        minForwardIntervalSeconds: 100,
+        staticUpdateIntervalSeconds: 100,
+        targetStalenessMinutes: 15,
+        ownVessel: {
+          enabled: true,
+          // A long position rate means the one fresh send happens on the
+          // very first tick (0 elapsed since ownVesselLastForwardAt=0
+          // trivially clears any rate), then never again during this
+          // test -- everything after that first send must come from the
+          // last-known-position path, not a second fresh read.
+          positionRateSeconds: 1000,
+          sendLastKnownPosition: true,
+          lastKnownPositionRateSeconds: 1
+        }
+      })
+
+      await new Promise((r) => setTimeout(r, 30)) // the first, fresh send
+      const afterFirst = h.received.length
+      expect(afterFirst).to.be.greaterThan(0)
+
+      await new Promise((r) => setTimeout(r, 2200)) // a couple of 1s poll ticks
+      plugin.stop()
+      await h.close()
+
+      // Same position, sent again without a new fix arriving -- proves the
+      // resend came from the stored last-known NMEA, not a fresh dynamic
+      // read (positionRateSeconds is far too long for that).
+      expect(h.received.length).to.be.greaterThan(afterFirst)
+    })
+  })
 })
