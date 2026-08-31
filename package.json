@@ -35,7 +35,7 @@
     "node": ">=18"
   },
   "signalk": {
-    "appIcon": "./public/app-icon.svg",
+    "appIcon": "app-icon.svg",
     "displayName": "AIS Forwarder"
   },
   "files": [
