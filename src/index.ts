@@ -17,10 +17,13 @@
  * AIVDM/AIVDO sentences on the server's event bus -- on this installation
  * (and many others using an N2K AIS receiver) those are never emitted
  * unless a separate NMEA2000-to-0183 conversion plugin is running.
- * Instead, like aisreporter, it reads the Signal K full data model
- * directly and re-encodes each received vessel's position into an AIS
- * sentence. This works regardless of whether the original AIS traffic
- * arrived via N2K, serial NMEA0183, or another plugin.
+ * Instead it subscribes to the Signal K delta stream, mirrors vessel
+ * state locally, and re-encodes each received vessel's position into an
+ * AIS sentence. This works regardless of whether the original AIS traffic
+ * arrived via N2K, serial NMEA0183, another plugin, or a Signal
+ * K-to-Signal K link from a second server -- and it keeps working across
+ * an upstream server restart, since the subscription is local and simply
+ * goes quiet while the far end is away.
  *
  * Own-vessel position reporting is optional (see the `ownVessel` config
  * group, off by default) and reuses the exact same encode.ts functions
@@ -33,10 +36,14 @@
 
 import * as dgram from 'dgram'
 import type {
+  Context,
+  Delta,
+  Path,
   Plugin,
   PluginRouter,
   Position,
-  ServerAPI
+  ServerAPI,
+  Unsubscribes
 } from '@signalk/server-api'
 import {
   encodePositionReport,
@@ -52,12 +59,11 @@ import {
 } from './encode'
 import { Stats } from './stats'
 
-// app.signalk.retrieve() is a real, widely-used server capability but is
-// not yet part of the published ServerAPI types (see the "typing is
-// incomplete" note in @signalk/server-api). Declared locally rather than
-// patched into node_modules.
-interface FullDataModelApp extends ServerAPI {
-  signalk: { retrieve(): { vessels?: Record<string, VesselNode> } }
+// selfId is a real, widely-used server property that is not part of the
+// published ServerAPI types (see the "typing is incomplete" note in
+// @signalk/server-api). Declared locally rather than patched into
+// node_modules.
+interface AisForwarderApp extends ServerAPI {
   selfId: string
 }
 
@@ -106,11 +112,22 @@ function resolveTrueHeadingRad(vessel: VesselNode): number | undefined {
   return undefined
 }
 
-// PGN 129038 = AIS Class A Position Report, 129039 = AIS Class B. Targets
-// arriving from a non-N2K source (no pgn tag) default to Class B, which
-// keeps the encoded sentence valid without guessing a nav status.
-function classifyAis(positionPgn: number | undefined): 'A' | 'B' {
-  return positionPgn === 129038 ? 'A' : 'B'
+// Signal K reports the transponder class on `sensors.ais.class` ('A', 'B'
+// or 'BASE' for shore base stations), independent of whether the target
+// arrived over N2K, serial NMEA0183, or a Signal K-to-Signal K link. This
+// deliberately does not look at the N2K PGN that tagged the delta: on a
+// server fed by another Signal K server that N2K metadata may be absent
+// or reshaped, and the class is data we are given directly anyway.
+// Anything unknown falls back to Class B, which keeps the encoded
+// sentence valid without having to invent a nav status.
+function classifyAis(aisClass: unknown): 'A' | 'B' {
+  return aisClass === 'A' ? 'A' : 'B'
+}
+
+// Base stations and ATONs share the vessels-shaped delta plumbing but are
+// not vessels, and must never be relayed as one.
+function isRelayableTarget(aisClass: unknown): boolean {
+  return aisClass === undefined || aisClass === 'A' || aisClass === 'B'
 }
 
 interface OwnVesselConfig {
@@ -159,8 +176,8 @@ function readConfig(
   return {
     endpoints: sanitizeEndpoints(props.endpoints, warn),
     // A floor of 1s on the two knobs that drive network/CPU cadence keeps a
-    // fat-fingered sub-second value from hammering app.signalk.retrieve()
-    // (a full data-model walk) or flooding MarineTraffic/AISHub far past any
+    // fat-fingered sub-second value from walking the whole vessel mirror
+    // on a tight loop, or flooding MarineTraffic/AISHub far past any
     // reasonable AIS reporting rate.
     pollIntervalSeconds: sanitizeRateSeconds(props.pollIntervalSeconds, 10, 1),
     minForwardIntervalSeconds: sanitizeRateSeconds(
@@ -187,7 +204,7 @@ function readConfig(
 }
 
 const createPlugin = function (appUntyped: ServerAPI) {
-  const app = appUntyped as FullDataModelApp
+  const app = appUntyped as AisForwarderApp
   const error = app.error || ((msg: string) => console.error(msg))
   const debug = app.debug || ((msg: string) => console.log(msg))
 
@@ -199,6 +216,90 @@ const createPlugin = function (appUntyped: ServerAPI) {
   const lastForwardAt = new Map<string, number>()
   const lastStaticAt = new Map<string, number>()
   let lastStartError: string | undefined
+
+  // Vessel state, mirrored from the delta stream in the same shape the
+  // full data model uses ({ value, timestamp } leaves under dotted
+  // paths), so every reader below (buildDynamic/buildStatic/
+  // resolveTrueHeadingRad/own-vessel) works unchanged.
+  //
+  // Deltas rather than app.signalk.retrieve() because the full model is
+  // not always populated: on a server fed by another Signal K server over
+  // a Signal K-to-Signal K connection, a core bug in
+  // handleNmea2000Source() throws on the mirrored N2K source metadata and
+  // the delta is dropped before it ever reaches the full model, leaving
+  // vessels present but position-less. The delta stream itself is
+  // unaffected. Reading deltas also means an upstream server restart just
+  // pauses the flow: the subscription is local to this server, nothing
+  // needs reconnecting here, and entries age out via
+  // targetStalenessMinutes on their own.
+  const vessels = new Map<string, VesselNode>()
+  let unsubscribes: Unsubscribes = []
+
+  // Delta paths are remote input: a crafted path segment could otherwise
+  // walk into Object.prototype while building the nested mirror.
+  const FORBIDDEN_PATH_SEGMENTS = new Set([
+    '__proto__',
+    'constructor',
+    'prototype'
+  ])
+
+  function storeValue(
+    vessel: VesselNode,
+    path: string,
+    value: unknown,
+    timestamp: string
+  ): void {
+    const parts = path.split('.')
+    if (parts.some((p) => p.length === 0 || FORBIDDEN_PATH_SEGMENTS.has(p))) {
+      return
+    }
+    let cursor = vessel as Record<string, unknown>
+    for (let i = 0; i < parts.length - 1; i++) {
+      const key = parts[i] as string
+      const next = cursor[key]
+      if (typeof next !== 'object' || next === null) cursor[key] = {}
+      cursor = cursor[key] as Record<string, unknown>
+    }
+    cursor[parts[parts.length - 1] as string] = { value, timestamp }
+  }
+
+  // A delta with an empty path carries vessel-level attributes (mmsi,
+  // name, ...) as a plain nested object rather than a value leaf.
+  function storeVesselAttributes(vessel: VesselNode, value: unknown): void {
+    if (typeof value !== 'object' || value === null) return
+    for (const [key, attr] of Object.entries(
+      value as Record<string, unknown>
+    )) {
+      if (FORBIDDEN_PATH_SEGMENTS.has(key)) continue
+      if (typeof attr === 'string' || typeof attr === 'number') {
+        vessel[key] = attr
+      }
+    }
+  }
+
+  function handleDelta(delta: Delta): void {
+    const context = delta.context
+    if (typeof context !== 'string' || !context.startsWith('vessels.')) return
+    const id = context.slice('vessels.'.length)
+    let vessel = vessels.get(id)
+    if (!vessel) {
+      vessel = {}
+      vessels.set(id, vessel)
+    }
+    for (const update of delta.updates ?? []) {
+      const timestamp =
+        typeof update.timestamp === 'string'
+          ? update.timestamp
+          : new Date().toISOString()
+      for (const pathValue of update.values ?? []) {
+        if (pathValue.path === '') {
+          storeVesselAttributes(vessel, pathValue.value)
+        } else if (typeof pathValue.path === 'string') {
+          storeValue(vessel, pathValue.path, pathValue.value, timestamp)
+        }
+      }
+    }
+  }
 
   function broadcast(nmea: string): void {
     const endpoints = cfg?.endpoints ?? []
@@ -267,8 +368,16 @@ const createPlugin = function (appUntyped: ServerAPI) {
       shipType: getValue<{ id?: number }>(vessel, 'design.aisShipType')?.id,
       length: getValue<{ overall?: number }>(vessel, 'design.length')?.overall,
       beam: getValue<number>(vessel, 'design.beam'),
-      fromBow: getValue<number>(vessel, 'sensors.gps.fromBow'),
-      fromCenter: getValue<number>(vessel, 'sensors.gps.fromCenter')
+      // AIS targets report the transponder's antenna offsets under
+      // sensors.ais.*; sensors.gps.* is where a vessel's own GPS offsets
+      // live. Own-vessel reporting supplies the latter, targets the
+      // former, so accept whichever is present.
+      fromBow:
+        getValue<number>(vessel, 'sensors.ais.fromBow') ??
+        getValue<number>(vessel, 'sensors.gps.fromBow'),
+      fromCenter:
+        getValue<number>(vessel, 'sensors.ais.fromCenter') ??
+        getValue<number>(vessel, 'sensors.gps.fromCenter')
     }
   }
 
@@ -279,14 +388,15 @@ const createPlugin = function (appUntyped: ServerAPI) {
     const minForwardMs = cfg.minForwardIntervalSeconds * 1000
     const staticIntervalMs = cfg.staticUpdateIntervalSeconds * 1000
 
-    const full = app.signalk.retrieve()
-    const vessels = full.vessels ?? {}
     const activeMmsi = new Set<string>()
 
-    for (const [context, vessel] of Object.entries(vessels)) {
+    for (const [context, vessel] of vessels) {
       if (context === app.selfId) continue
       const mmsi = typeof vessel.mmsi === 'string' ? vessel.mmsi : undefined
       if (!mmsi) continue
+
+      const reportedClass = getValue<unknown>(vessel, 'sensors.ais.class')
+      if (!isRelayableTarget(reportedClass)) continue
 
       const positionNode = getNode(vessel, 'navigation.position')
       const position = positionNode?.value as Position | undefined
@@ -303,7 +413,7 @@ const createPlugin = function (appUntyped: ServerAPI) {
         : NaN
       if (!Number.isFinite(positionAge) || positionAge > stalenessMs) continue
 
-      const aisClass = classifyAis(positionNode?.pgn)
+      const aisClass = classifyAis(reportedClass)
       activeMmsi.add(mmsi)
       stats.noteTargetSeen(mmsi, vessel.name as string | undefined, aisClass)
 
@@ -352,6 +462,23 @@ const createPlugin = function (appUntyped: ServerAPI) {
         lastStaticAt.delete(mmsi)
       }
     }
+    pruneVesselMirror(now, stalenessMs)
+  }
+
+  // The mirror is fed by deltas and nothing removes entries on its own, so
+  // a long-running server would otherwise accumulate every vessel it ever
+  // heard of. Self is kept regardless: own-vessel reporting needs it even
+  // while the position is stale (that is what sendLastKnownPosition is
+  // for), and there is only ever one of it.
+  function pruneVesselMirror(now: number, stalenessMs: number): void {
+    for (const [context, vessel] of vessels) {
+      if (context === app.selfId) continue
+      const timestamp = getNode(vessel, 'navigation.position')?.timestamp
+      const age = timestamp ? now - Date.parse(timestamp) : NaN
+      if (!Number.isFinite(age) || age > stalenessMs) {
+        vessels.delete(context)
+      }
+    }
   }
 
   // Own-vessel reporting state. Single-value, not a Map keyed by mmsi like
@@ -374,8 +501,7 @@ const createPlugin = function (appUntyped: ServerAPI) {
   function pollOwnVessel(): void {
     if (!cfg?.ownVessel.enabled) return
     const now = Date.now()
-    const vessels = app.signalk.retrieve().vessels ?? {}
-    const self = vessels[app.selfId]
+    const self = vessels.get(app.selfId)
     if (!self) return
 
     const mmsi =
@@ -557,11 +683,11 @@ const createPlugin = function (appUntyped: ServerAPI) {
     start: function (props: object) {
       lastStartError = undefined
       if (
-        typeof app.signalk?.retrieve !== 'function' ||
+        typeof app.subscriptionmanager?.subscribe !== 'function' ||
         typeof app.selfId !== 'string'
       ) {
         const msg =
-          'signalk-ais-forwarder not started: server is missing app.signalk.retrieve/app.selfId'
+          'signalk-ais-forwarder not started: server is missing app.subscriptionmanager/app.selfId'
         error(msg)
         lastStartError = msg
         plugin.started = false
@@ -590,6 +716,22 @@ const createPlugin = function (appUntyped: ServerAPI) {
         // though the socket broadcast() sends into is now likely broken.
         stats.noteSocketError(err.message)
       })
+      // minPeriod throttles per path so a busy bus can't fire the handler
+      // thousands of times between polls; the mirror only needs to be
+      // current by the next poll tick, not instantaneous.
+      unsubscribes = []
+      app.subscriptionmanager.subscribe(
+        {
+          context: '*' as Context,
+          subscribe: [{ path: '*' as Path, policy: 'instant', minPeriod: 1000 }]
+        },
+        unsubscribes,
+        (err: unknown) => {
+          error(`subscription error: ${err}`)
+        },
+        handleDelta
+      )
+
       pollTimer = setInterval(() => {
         poll()
         pollOwnVessel()
@@ -614,6 +756,15 @@ const createPlugin = function (appUntyped: ServerAPI) {
         udpSocket.close()
         udpSocket = undefined
       }
+      unsubscribes.forEach((f) => {
+        try {
+          f()
+        } catch (err) {
+          debug(`unsubscribe failed (ignored): ${err}`)
+        }
+      })
+      unsubscribes = []
+      vessels.clear()
       lastForwardAt.clear()
       lastStaticAt.clear()
       ownVesselLastForwardAt = 0

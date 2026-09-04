@@ -124,13 +124,13 @@ Off by default, and independent of everything above — enabling it does
 not change target forwarding, and it shares only the endpoint list and
 the encoding code. Configured under **Own-vessel reporting**:
 
-| Setting                        | Default | Meaning                                                                                                                             |
-| ------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Setting                         | Default | Meaning                                                                                                                                                                                  |
+| ------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Enabled                         | off     | Turns own-vessel position/static reporting on. Requires this vessel to have an MMSI configured (Server → Settings); logged once, otherwise, and reporting stays paused until one is set. |
-| Position rate                   | 60s     | How often this vessel's own position is (re-)encoded and sent, mirroring `aisreporter`'s default.                                    |
-| Static rate                     | 360s    | How often this vessel's own static/voyage data (name, callsign, dimensions) is (re-)sent, once a first position has gone out.        |
-| Send last known position        | off     | If on, keeps resending the last successfully sent position at the rate below whenever no fresh fix is available (e.g. GPS dropout).  |
-| Last known position resend rate | 180s    | Only used when "Send last known position" is on.                                                                                      |
+| Position rate                   | 60s     | How often this vessel's own position is (re-)encoded and sent, mirroring `aisreporter`'s default.                                                                                        |
+| Static rate                     | 360s    | How often this vessel's own static/voyage data (name, callsign, dimensions) is (re-)sent, once a first position has gone out.                                                            |
+| Send last known position        | off     | If on, keeps resending the last successfully sent position at the rate below whenever no fresh fix is available (e.g. GPS dropout).                                                      |
+| Last known position resend rate | 180s    | Only used when "Send last known position" is on.                                                                                                                                         |
 
 Own-vessel messages are encoded as AIS Class B (type 18 position, type
 24 static parts 0/1), same as `aisreporter`'s default. A vessel with no

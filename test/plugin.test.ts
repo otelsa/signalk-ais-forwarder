@@ -2,10 +2,15 @@
  * End-to-end tests for the plugin.
  *
  * A stub Signal K app exposes only what the plugin actually uses
- * (signalk.retrieve, selfId, handleMessage, setPluginStatus, error/debug)
- * plus a real UDP socket bound to 127.0.0.1 that captures whatever the
- * plugin sends, so each test exercises the full path: poll tick -> read
- * the data model -> encode -> UDP send -> decode.
+ * (subscriptionmanager, selfId, handleMessage, setPluginStatus,
+ * error/debug) plus a real UDP socket bound to 127.0.0.1 that captures
+ * whatever the plugin sends, so each test exercises the full path:
+ * delta in -> mirror -> poll tick -> encode -> UDP send -> decode.
+ *
+ * Tests still describe vessels in the familiar full-data-model shape via
+ * `h.vessels`; the harness converts that to the deltas the plugin
+ * actually consumes at subscribe time, which is before start()'s first
+ * poll, so the timing matches a real server that already has state.
  */
 
 import { expect } from 'chai'
@@ -30,6 +35,8 @@ interface Harness {
   handled: Array<Record<string, unknown>>
   received: Buffer[]
   port: number
+  /** Re-emit `vessels` as deltas, for changes made after start(). */
+  feed: () => void
   close: () => Promise<void>
 }
 
@@ -52,9 +59,64 @@ async function createHarness(): Promise<Harness> {
   const vessels: Record<string, any> = {}
   const handled: Array<Record<string, unknown>> = []
 
+  // Turns one full-data-model vessel node into the delta a real server
+  // would have sent to produce it: every { value, timestamp } leaf becomes
+  // a path/value pair, and bare scalars on the vessel itself (mmsi, name)
+  // become the empty-path attribute object.
+  const toDelta = (context: string, vessel: any) => {
+    const values: Array<{ path: string; value: unknown }> = []
+    const attributes: Record<string, unknown> = {}
+    const walk = (node: any, prefix: string) => {
+      for (const [key, child] of Object.entries(node ?? {})) {
+        const path = prefix ? `${prefix}.${key}` : key
+        if (child !== null && typeof child === 'object') {
+          if ('value' in (child as any)) {
+            values.push({ path, value: (child as any).value })
+          } else {
+            walk(child, path)
+          }
+        } else if (!prefix) {
+          attributes[key] = child
+        }
+      }
+    }
+    walk(vessel, '')
+    if (Object.keys(attributes).length > 0) {
+      values.push({ path: '', value: attributes })
+    }
+    // Timestamps are per-leaf in the model but per-update in a delta; use
+    // the position's when present so staleness tests keep their meaning.
+    const timestamp =
+      vessel?.navigation?.position?.timestamp ?? new Date().toISOString()
+    return { context: `vessels.${context}`, updates: [{ timestamp, values }] }
+  }
+
+  let deltaCallback: ((delta: any) => void) | undefined
+  const feed = () => {
+    if (!deltaCallback) return
+    for (const [context, vessel] of Object.entries(vessels)) {
+      deltaCallback(toDelta(context, vessel))
+    }
+  }
+
   const app: any = {
     selfId: 'urn:mrn:imo:mmsi:211653340',
-    signalk: { retrieve: () => ({ vessels }) },
+    subscriptionmanager: {
+      subscribe: (
+        _cmd: unknown,
+        _unsubscribes: Array<() => void>,
+        _errCb: unknown,
+        callback: (delta: any) => void
+      ) => {
+        deltaCallback = callback
+        _unsubscribes.push(() => {
+          deltaCallback = undefined
+        })
+        // Replay current state immediately, like a server that already
+        // holds it when the plugin subscribes.
+        feed()
+      }
+    },
     handleMessage: (_id: string, msg: Record<string, unknown>) =>
       handled.push(msg),
     setPluginStatus: () => undefined,
@@ -68,6 +130,7 @@ async function createHarness(): Promise<Harness> {
     handled,
     received,
     port,
+    feed,
     close: () => new Promise((resolve) => server.close(() => resolve()))
   }
 }
@@ -129,23 +192,27 @@ function foreignVessel(opts: {
   mmsi: string
   lat: number
   lon: number
-  pgn?: number
+  aisClass?: 'A' | 'B' | 'BASE'
   name?: string
   navState?: string
   ageMs?: number
+  timestamp?: string
 }): any {
-  const timestamp = new Date(Date.now() - (opts.ageMs ?? 0)).toISOString()
+  const timestamp =
+    opts.timestamp ?? new Date(Date.now() - (opts.ageMs ?? 0)).toISOString()
   return {
     mmsi: opts.mmsi,
     name: opts.name,
     navigation: {
       position: {
         value: { latitude: opts.lat, longitude: opts.lon },
-        timestamp,
-        pgn: opts.pgn
+        timestamp
       },
       ...(opts.navState ? { state: { value: opts.navState } } : {})
-    }
+    },
+    ...(opts.aisClass
+      ? { sensors: { ais: { class: { value: opts.aisClass } } } }
+      : {})
   }
 }
 
@@ -156,7 +223,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '261999999',
       lat: 54.35,
       lon: 18.65,
-      pgn: 129039,
+      aisClass: 'B',
       name: 'FOREIGN B'
     })
 
@@ -181,13 +248,13 @@ describe('signalk-ais-forwarder', () => {
     expect(position!.lat).to.be.closeTo(54.35, 0.01)
   })
 
-  it('forwards a Class A target (pgn 129038) as type 1 with nav status', async () => {
+  it('forwards a Class A target (sensors.ais.class = A) as type 1 with nav status', async () => {
     const h = await createHarness()
     h.vessels['urn:mrn:imo:mmsi:261888888'] = foreignVessel({
       mmsi: '261888888',
       lat: 54.4,
       lon: 18.7,
-      pgn: 129038,
+      aisClass: 'A',
       name: 'FOREIGN A',
       navState: 'anchored'
     })
@@ -220,7 +287,7 @@ describe('signalk-ais-forwarder', () => {
         position: {
           value: { latitude: 54.35, longitude: 18.65 },
           timestamp: new Date().toISOString(),
-          pgn: 129039
+          aisClass: 'B'
         }
       },
       communication: { callsignVhf: { value: 'DA1234' } },
@@ -264,7 +331,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '211653340',
       lat: 1,
       lon: 1,
-      pgn: 129038
+      aisClass: 'A'
     })
 
     const plugin = createPlugin(h.app)
@@ -289,7 +356,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '261777777',
       lat: 54.35,
       lon: 18.65,
-      pgn: 129039,
+      aisClass: 'B',
       ageMs: 20 * 60 * 1000 // 20 minutes old
     })
 
@@ -315,7 +382,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '261666666',
       lat: 54.35,
       lon: 18.65,
-      pgn: 129039,
+      aisClass: 'B',
       name: 'TRACKED'
     })
 
@@ -388,7 +455,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '261222222',
       lat: NaN,
       lon: 18.65,
-      pgn: 129039
+      aisClass: 'B'
     })
 
     const plugin = createPlugin(h.app)
@@ -415,7 +482,7 @@ describe('signalk-ais-forwarder', () => {
         position: {
           value: { latitude: 54.35, longitude: 18.65 },
           timestamp: new Date().toISOString(),
-          pgn: 129039
+          aisClass: 'B'
         },
         headingMagnetic: { value: 1.0 }, // ~57.3deg
         magneticVariation: { value: 0.1 } // ~5.7deg east
@@ -443,19 +510,18 @@ describe('signalk-ais-forwarder', () => {
     expect(position!.hdg).to.be.closeTo(expectedDeg % 360, 1)
   })
 
-  it('does not forward a target whose position has no timestamp at all', async () => {
+  it('does not forward a target whose position timestamp cannot be parsed', async () => {
     const h = await createHarness()
-    h.vessels['urn:mrn:imo:mmsi:261111111'] = {
+    // A delta always carries some timestamp, but nothing guarantees it
+    // parses -- an unparseable one leaves the age unknown, and an unknown
+    // age must never count as fresh.
+    h.vessels['urn:mrn:imo:mmsi:261111111'] = foreignVessel({
       mmsi: '261111111',
-      navigation: {
-        position: {
-          value: { latitude: 54.35, longitude: 18.65 },
-          pgn: 129039
-          // no timestamp field -- age can't be computed, so it can't be
-          // proven fresh either
-        }
-      }
-    }
+      lat: 54.35,
+      lon: 18.65,
+      aisClass: 'B',
+      timestamp: 'not-a-timestamp'
+    })
 
     const plugin = createPlugin(h.app)
     plugin.start({
@@ -479,7 +545,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '261000000',
       lat: 54.35,
       lon: 18.65,
-      pgn: 129039
+      aisClass: 'B'
     })
 
     const plugin = createPlugin(h.app)
@@ -504,7 +570,7 @@ describe('signalk-ais-forwarder', () => {
     expect(getSnapshot().messagesSentTotal).to.equal(0)
   })
 
-  it('stops tracking a target once it disappears entirely, without leaking its per-target throttle state', async function () {
+  it('stops tracking a target once it goes silent, without leaking its per-target throttle state', async function () {
     this.timeout(5000) // needs a real ~1s poll tick past the floored pollIntervalSeconds
     const h = await createHarness()
     const vesselKey = 'urn:mrn:imo:mmsi:261444444'
@@ -512,7 +578,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '261444444',
       lat: 54.35,
       lon: 18.65,
-      pgn: 129039,
+      aisClass: 'B',
       name: 'FLAPPY'
     })
 
@@ -525,12 +591,25 @@ describe('signalk-ais-forwarder', () => {
       pollIntervalSeconds: 1,
       minForwardIntervalSeconds: 0.01,
       staticUpdateIntervalSeconds: 100,
-      targetStalenessMinutes: 15
+      // Below the age the target is re-fed with, so one silent target ages
+      // out within this test rather than in fifteen minutes.
+      targetStalenessMinutes: 1
     })
 
     await new Promise((r) => setTimeout(r, 30)) // first poll (from start()) forwards it
-    delete h.vessels[vesselKey] // vessel disappears from the data model entirely
-    await new Promise((r) => setTimeout(r, 1100)) // a later poll tick sees it gone and prunes it
+    // A target doesn't vanish from a delta feed -- it simply stops sending.
+    // Re-feed it once with an old timestamp so the next tick sees it as
+    // stale and prunes it from both the mirror and the throttle maps.
+    h.vessels[vesselKey] = foreignVessel({
+      mmsi: '261444444',
+      lat: 54.35,
+      lon: 18.65,
+      aisClass: 'B',
+      name: 'FLAPPY',
+      ageMs: 5 * 60 * 1000
+    })
+    h.feed()
+    await new Promise((r) => setTimeout(r, 1100)) // a later poll tick prunes it
 
     const { router, getSnapshot } = fakeStatusRouter()
     plugin.registerWithRouter(router)
@@ -546,7 +625,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '261333333',
       lat: 54.35,
       lon: 18.65,
-      pgn: 129039
+      aisClass: 'B'
     })
 
     const plugin = createPlugin(h.app)
@@ -586,7 +665,7 @@ describe('signalk-ais-forwarder', () => {
       mmsi: '261555555',
       lat: 54.35,
       lon: 18.65,
-      pgn: 129039,
+      aisClass: 'B',
       name: 'ERR TARGET'
     })
 
@@ -844,6 +923,121 @@ describe('signalk-ais-forwarder', () => {
       // resend came from the stored last-known NMEA, not a fresh dynamic
       // read (positionRateSeconds is far too long for that).
       expect(h.received.length).to.be.greaterThan(afterFirst)
+    })
+  })
+
+  describe('upstream data source outages', () => {
+    it('resumes forwarding on its own after the feed goes silent and comes back', async function () {
+      this.timeout(6000)
+      const h = await createHarness()
+      const key = 'urn:mrn:imo:mmsi:261555111'
+      h.vessels[key] = foreignVessel({
+        mmsi: '261555111',
+        lat: 54.35,
+        lon: 18.65,
+        aisClass: 'B',
+        name: 'COMES BACK'
+      })
+
+      const plugin = createPlugin(h.app)
+      plugin.start({
+        endpoints: [{ ipaddress: '127.0.0.1', port: h.port }],
+        pollIntervalSeconds: 1,
+        minForwardIntervalSeconds: 0.01,
+        staticUpdateIntervalSeconds: 100,
+        targetStalenessMinutes: 1
+      })
+
+      await new Promise((r) => setTimeout(r, 30))
+      expect(h.received.length).to.be.greaterThan(0)
+
+      // The upstream server goes away: no more deltas, and what we hold
+      // ages past the staleness window, so forwarding correctly stops.
+      h.vessels[key] = foreignVessel({
+        mmsi: '261555111',
+        lat: 54.35,
+        lon: 18.65,
+        aisClass: 'B',
+        name: 'COMES BACK',
+        ageMs: 5 * 60 * 1000
+      })
+      h.feed()
+      await new Promise((r) => setTimeout(r, 1100))
+      const duringOutage = h.received.length
+
+      // Upstream is back with fresh data. Nothing restarted the plugin --
+      // it must pick straight back up, because the subscription is local
+      // and never went away.
+      h.vessels[key] = foreignVessel({
+        mmsi: '261555111',
+        lat: 54.36,
+        lon: 18.66,
+        aisClass: 'B',
+        name: 'COMES BACK'
+      })
+      h.feed()
+      await new Promise((r) => setTimeout(r, 1100))
+
+      plugin.stop()
+      await h.close()
+
+      expect(h.received.length).to.be.greaterThan(duringOutage)
+    })
+
+    it('classifies without any N2K metadata in the delta', async () => {
+      const h = await createHarness()
+      h.vessels['urn:mrn:imo:mmsi:261555222'] = foreignVessel({
+        mmsi: '261555222',
+        lat: 54.4,
+        lon: 18.7,
+        aisClass: 'A',
+        navState: 'anchored'
+      })
+
+      const plugin = createPlugin(h.app)
+      plugin.start({
+        endpoints: [{ ipaddress: '127.0.0.1', port: h.port }],
+        pollIntervalSeconds: 100,
+        minForwardIntervalSeconds: 0.01,
+        staticUpdateIntervalSeconds: 100,
+        targetStalenessMinutes: 15
+      })
+
+      await new Promise((r) => setTimeout(r, 50))
+      plugin.stop()
+      await h.close()
+
+      const decoded = h.received.map((b) => new AisDecode(b.toString().trim()))
+      const position = decoded.find((d) => d.aistype === 1)
+      expect(position, 'Class A came through with no pgn anywhere').to.not.be
+        .undefined
+      expect(position!.navstatus).to.equal(1)
+    })
+
+    it('never relays a shore base station as a vessel', async () => {
+      const h = await createHarness()
+      h.vessels['urn:mrn:imo:mmsi:002614500'] = foreignVessel({
+        mmsi: '002614500',
+        lat: 54.5,
+        lon: 18.5,
+        aisClass: 'BASE',
+        name: 'BASE STATION'
+      })
+
+      const plugin = createPlugin(h.app)
+      plugin.start({
+        endpoints: [{ ipaddress: '127.0.0.1', port: h.port }],
+        pollIntervalSeconds: 100,
+        minForwardIntervalSeconds: 0.01,
+        staticUpdateIntervalSeconds: 100,
+        targetStalenessMinutes: 15
+      })
+
+      await new Promise((r) => setTimeout(r, 50))
+      plugin.stop()
+      await h.close()
+
+      expect(h.received.length).to.equal(0)
     })
   })
 })
